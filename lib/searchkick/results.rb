@@ -178,7 +178,8 @@ module Searchkick
     def results_query(records, hits)
       ids = hits.map { |hit| hit["_id"] }
 
-      if options[:includes]
+      includes = records.searchkick_options[:include].to_a & options[:includes].to_a
+      if !includes.empty?
         records =
           if defined?(NoBrainer::Document) && records < NoBrainer::Document
             records.preload(options[:includes])
