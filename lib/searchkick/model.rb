@@ -43,16 +43,27 @@ module Searchkick
             class_variable_get(:@@searchkick_callbacks) && Searchkick.callbacks?
           end
 
-          def searchkick_reindex(options = {})
-            unless options[:accept_danger]
-              if (respond_to?(:current_scope) && respond_to?(:default_scoped) && current_scope && current_scope.to_sql != default_scoped.to_sql) ||
-                (respond_to?(:queryable) && queryable != unscoped.with_default_scope)
-                raise Searchkick::DangerousOperation, "Only call reindex on models, not relations. Pass `accept_danger: true` if this is your intention."
+          def searchkick_reindex(method_name = nil, **options)
+            if method_name
+              searchkick_index.import_scope(searchkick_klass, method_name: method_name)
+              searchkick_index.refresh
+              true
+            else
+              unless options[:accept_danger]
+                if (respond_to?(:current_scope) && respond_to?(:default_scoped) && current_scope && current_scope.to_sql != default_scoped.to_sql) ||
+                  (respond_to?(:queryable) && queryable != unscoped.with_default_scope)
+                  raise Searchkick::DangerousOperation, "Only call reindex on models, not relations. Pass `accept_danger: true` if this is your intention."
+                end
               end
+              searchkick_index.reindex_scope(searchkick_klass, options)
             end
-            searchkick_index.reindex_scope(searchkick_klass, options)
           end
           alias_method :reindex, :searchkick_reindex unless method_defined?(:reindex)
+
+          def searchkick_partial_reindex(method_name)
+            searchkick_reindex(method_name)
+          end
+          alias_method :partial_reindex, :searchkick_partial_reindex unless method_defined?(:partial_reindex)
 
           def clean_indices
             searchkick_index.clean_indices
@@ -69,6 +80,12 @@ module Searchkick
           def searchkick_index_options
             searchkick_index.index_options
           end
+
+          def searchkick_debug
+            warn "Use debug option with search method instead"
+
+            nil # do not return anything, as this is strictly used for manual debugging
+          end
         end
         extend Searchkick::Reindex # legacy for Searchjoy
 
@@ -80,13 +97,23 @@ module Searchkick
           after_destroy callback_name, if: proc { self.class.search_callbacks? }
         end
 
-        def reindex
-          self.class.searchkick_index.reindex_record(self)
+        def reindex(method_name = nil, **options)
+          if method_name
+            self.class.searchkick_index.bulk_update([self], method_name)
+          else
+            self.class.searchkick_index.reindex_record(self)
+          end
+          self.class.searchkick_index.refresh if options[:refresh]
         end unless method_defined?(:reindex)
 
         def reindex_async
           self.class.searchkick_index.reindex_record_async(self)
         end unless method_defined?(:reindex_async)
+
+        def partial_reindex(method_name)
+          reindex(method_name, refresh: true)
+          true
+        end unless method_defined?(:partial_reindex)
 
         def similar(options = {})
           self.class.searchkick_index.similar_record(self, options)

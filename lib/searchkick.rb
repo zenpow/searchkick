@@ -2,7 +2,9 @@ require "active_model"
 require "elasticsearch"
 require "hashie"
 require "searchkick/version"
+require "searchkick/index_options"
 require "searchkick/index"
+require "searchkick/indexer"
 require "searchkick/results"
 require "searchkick/query"
 require "searchkick/reindex_job"
@@ -10,6 +12,7 @@ require "searchkick/model"
 require "searchkick/tasks"
 require "searchkick/middleware"
 require "searchkick/logging" if defined?(ActiveSupport::Notifications)
+require "active_support/core_ext/hash/deep_merge"
 
 # background jobs
 begin
@@ -28,22 +31,32 @@ module Searchkick
   class ImportError < Error; end
 
   class << self
-    attr_accessor :search_method_name, :wordnet_path, :timeout, :models
+    attr_accessor :search_method_name, :wordnet_path, :timeout, :models, :client_options
     attr_writer :client, :env, :search_timeout
+    attr_reader :aws_credentials
   end
   self.search_method_name = :search
   self.wordnet_path = "/var/lib/wn_s.pl"
   self.timeout = 10
   self.models = []
+  self.client_options = {}
 
   def self.client
-    @client ||=
-      Elasticsearch::Client.new(
+    @client ||= begin
+      require "typhoeus/adapters/faraday" if defined?(Typhoeus)
+
+      Elasticsearch::Client.new({
         url: ENV["ELASTICSEARCH_URL"],
-        transport_options: {request: {timeout: timeout}}
-      ) do |f|
+        transport_options: {request: {timeout: timeout}, headers: {content_type: "application/json"}}
+      }.deep_merge(client_options)) do |f|
         f.use Searchkick::Middleware
+        f.request :aws_signers_v4, {
+          credentials: Aws::Credentials.new(aws_credentials[:access_key_id], aws_credentials[:secret_access_key]),
+          service_name: "es",
+          region: aws_credentials[:region] || "us-east-1"
+        } if aws_credentials
       end
+    end
   end
 
   def self.env
@@ -59,78 +72,7 @@ module Searchkick
   end
 
   def self.server_below?(version)
-    Gem::Version.new(server_version) < Gem::Version.new(version)
-  end
-
-  def self.enable_callbacks
-    self.callbacks_value = nil
-  end
-
-  def self.disable_callbacks
-    self.callbacks_value = false
-  end
-
-  def self.callbacks?
-    Thread.current[:searchkick_callbacks_enabled].nil? || Thread.current[:searchkick_callbacks_enabled]
-  end
-
-  def self.callbacks(value)
-    if block_given?
-      previous_value = callbacks_value
-      begin
-        self.callbacks_value = value
-        yield
-        perform_bulk if callbacks_value == :bulk
-      ensure
-        self.callbacks_value = previous_value
-      end
-    else
-      self.callbacks_value = value
-    end
-  end
-
-  # private
-  def self.queue_items(items)
-    queued_items.concat(items)
-    perform_bulk unless callbacks_value == :bulk
-  end
-
-  # private
-  def self.perform_bulk
-    items = queued_items
-    clear_queued_items
-    perform_items(items)
-  end
-
-  # private
-  def self.perform_items(items)
-    if items.any?
-      response = client.bulk(body: items)
-      if response["errors"]
-        first_item = response["items"].first
-        raise Searchkick::ImportError, (first_item["index"] || first_item["delete"])["error"]
-      end
-    end
-  end
-
-  # private
-  def self.queued_items
-    Thread.current[:searchkick_queued_items] ||= []
-  end
-
-  # private
-  def self.clear_queued_items
-    Thread.current[:searchkick_queued_items] = []
-  end
-
-  # private
-  def self.callbacks_value
-    Thread.current[:searchkick_callbacks_enabled]
-  end
-
-  # private
-  def self.callbacks_value=(value)
-    Thread.current[:searchkick_callbacks_enabled] = value
+    Gem::Version.new(server_version.sub("-", ".")) < Gem::Version.new(version.sub("-", "."))
   end
 
   def self.search(term = nil, options = {}, &block)
@@ -151,6 +93,56 @@ module Searchkick
       end
     end
     nil
+  end
+
+  # callbacks
+
+  def self.enable_callbacks
+    self.callbacks_value = nil
+  end
+
+  def self.disable_callbacks
+    self.callbacks_value = false
+  end
+
+  def self.callbacks?
+    Thread.current[:searchkick_callbacks_enabled].nil? || Thread.current[:searchkick_callbacks_enabled]
+  end
+
+  def self.callbacks(value)
+    if block_given?
+      previous_value = callbacks_value
+      begin
+        self.callbacks_value = value
+        yield
+        indexer.perform if callbacks_value == :bulk
+      ensure
+        self.callbacks_value = previous_value
+      end
+    else
+      self.callbacks_value = value
+    end
+  end
+
+  def self.aws_credentials=(creds)
+    require "faraday_middleware/aws_signers_v4"
+    @aws_credentials = creds
+    @client = nil # reset client
+  end
+
+  # private
+  def self.indexer
+    Thread.current[:searchkick_indexer] ||= Searchkick::Indexer.new
+  end
+
+  # private
+  def self.callbacks_value
+    Thread.current[:searchkick_callbacks_enabled]
+  end
+
+  # private
+  def self.callbacks_value=(value)
+    Thread.current[:searchkick_callbacks_enabled] = value
   end
 end
 

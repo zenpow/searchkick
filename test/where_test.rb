@@ -31,6 +31,14 @@ class WhereTest < Minitest::Test
     assert_search "product", ["Product A", "Product B", "Product C"], where: {or: [[{in_stock: true}, {store_id: 3}]]}
     assert_search "product", ["Product A", "Product B", "Product C"], where: {or: [[{orders_count: [2, 4]}, {store_id: [1, 2]}]]}
     assert_search "product", ["Product A", "Product D"], where: {or: [[{orders_count: 1}, {created_at: {gte: now - 1}, backordered: true}]]}
+    # _or
+    assert_search "product", ["Product A", "Product B", "Product C"], where: {_or: [{in_stock: true}, {store_id: 3}]}
+    assert_search "product", ["Product A", "Product B", "Product C"], where: {_or: [{orders_count: [2, 4]}, {store_id: [1, 2]}]}
+    assert_search "product", ["Product A", "Product D"], where: {_or: [{orders_count: 1}, {created_at: {gte: now - 1}, backordered: true}]}
+    # _and
+    assert_search "product", ["Product A"], where: {_and: [{in_stock: true}, {backordered: true}]}
+    # _not
+    assert_search "product", ["Product B", "Product C"], where: {_not: {_or: [{orders_count: 1}, {created_at: {gte: now - 1}, backordered: true}]}}
     # all
     assert_search "product", ["Product A", "Product C"], where: {user_ids: {all: [1, 3]}}
     assert_search "product", [], where: {user_ids: {all: [1, 2, 3, 4]}}
@@ -137,6 +145,21 @@ class WhereTest < Minitest::Test
     assert_search "san", ["San Francisco", "San Antonio"], where: {location: {near: {lat: 37, lon: -122}, within: "2000mi"}}
   end
 
+  def test_geo_polygon
+    store [
+      {name: "San Francisco", latitude: 37.7833, longitude: -122.4167},
+      {name: "San Antonio", latitude: 29.4167, longitude: -98.5000},
+      {name: "San Marino", latitude: 43.9333, longitude: 12.4667}
+    ]
+    polygon = [
+      {lat: 42.185695, lon: -125.496146},
+      {lat: 42.185695, lon: -94.125535},
+      {lat: 27.122789, lon: -94.125535},
+      {lat: 27.12278, lon: -125.496146}
+    ]
+    assert_search "san", ["San Francisco", "San Antonio"], where: {location: {geo_polygon: {points: polygon}}}
+  end
+
   def test_top_left_bottom_right
     store [
       {name: "San Francisco", latitude: 37.7833, longitude: -122.4167},
@@ -167,5 +190,12 @@ class WhereTest < Minitest::Test
       {name: "San Antonio", latitude: 29.4167, longitude: -98.5000}
     ]
     assert_search "san", ["San Francisco"], where: {multiple_locations: {near: {lat: 37.5, lon: -122.5}}}
+  end
+
+  def test_nested
+    store [
+      {name: "Product A", details: {year: 2016}}
+    ]
+    assert_search "product", ["Product A"], where: {"details.year" => 2016}
   end
 end

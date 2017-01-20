@@ -1,3 +1,65 @@
+## 1.5.1
+
+- Added `client_options`
+- Added `refresh` option to `reindex` method
+- Improved syntax for partial reindex
+
+## 1.5.0
+
+- Added support for geo shape indexing and queries
+- Added `_and`, `_or`, `_not` to `where` option
+
+## 1.4.2
+
+- Added support for directional synonyms
+- Easier AWS setup
+- Fixed `total_docs` method for ES 5+
+- Fixed exception on update errors
+
+## 1.4.1
+
+- Added `partial_reindex` method
+- Added `debug` option to `search` method
+- Added `profile` option
+
+## 1.4.0
+
+- Official support for Elasticsearch 5
+- Boost exact matches for partial matching
+- Added `searchkick_debug` method
+- Added `geo_polygon` filter
+
+## 1.3.6
+
+- Fixed `Job adapter not found` error
+
+## 1.3.5
+
+- Added support for Elasticsearch 5.0 beta
+- Added `request_params` option
+- Added `filterable` option
+
+## 1.3.4
+
+- Added `resume` option to reindex
+- Added search timeout to payload
+
+## 1.3.3
+
+- Fix for namespaced models (broken in 1.3.2)
+
+## 1.3.2
+
+- Added `body_options` option
+- Added `date_histogram` aggregation
+- Added `indices_boost` option
+- Added support for multiple conversions
+
+## 1.3.1
+
+- Fixed error with Ruby 2.0
+- Fixed error with indexing large fields
+
 ## 1.3.0
 
 - Added support for Elasticsearch 5.0 alpha

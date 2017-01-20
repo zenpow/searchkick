@@ -10,8 +10,7 @@ module Searchkick
       :took, :error, :model_name, :entry_name, :total_count, :total_entries,
       :current_page, :per_page, :limit_value, :padding, :total_pages, :num_pages,
       :offset_value, :offset, :previous_page, :prev_page, :next_page, :first_page?, :last_page?,
-      :out_of_range?, :hits
-
+      :out_of_range?, :hits, :response, :to_a, :first
 
     def initialize(klass, term, options = {})
       if term.is_a?(Hash)
@@ -29,6 +28,12 @@ module Searchkick
       @term = term
       @options = options
       @match_suffix = options[:match] || searchkick_options[:match] || "analyzed"
+
+      # prevent Ruby warnings
+      @type = nil
+      @routing = nil
+      @misspellings_below = nil
+      @highlighted_fields = nil
 
       prepare
     end
@@ -59,8 +64,9 @@ module Searchkick
         index: index,
         body: body
       }
-      params.merge!(type: @type) if @type
-      params.merge!(routing: @routing) if @routing
+      params[:type] = @type if @type
+      params[:routing] = @routing if @routing
+      params.merge!(options[:request_params]) if options[:request_params]
       params
     end
 
@@ -86,7 +92,7 @@ module Searchkick
 
       # no easy way to tell which host the client will use
       host = Searchkick.client.transport.hosts.first
-      credentials = (host[:user] || host[:password]) ? "#{host[:user]}:#{host[:password]}@" : nil
+      credentials = host[:user] || host[:password] ? "#{host[:user]}:#{host[:password]}@" : nil
       "curl #{host[:protocol]}://#{credentials}#{host[:host]}:#{host[:port]}/#{CGI.escape(index)}#{type ? "/#{type.map { |t| CGI.escape(t) }.join(',')}" : ''}/_search?pretty -d '#{query[:body].to_json}'"
     end
 
@@ -106,10 +112,51 @@ module Searchkick
         padding: @padding,
         load: @load,
         includes: options[:include] || options[:includes],
-        json: !options[:json].nil?,
+        json: !@json.nil?,
         match_suffix: @match_suffix,
         highlighted_fields: @highlighted_fields || []
       }
+
+      if options[:debug]
+        require "pp"
+
+        puts "Searchkick Version: #{Searchkick::VERSION}"
+        puts "Elasticsearch Version: #{Searchkick.server_version}"
+        puts
+
+        puts "Model Searchkick Options"
+        pp searchkick_options
+        puts
+
+        puts "Search Options"
+        pp options
+        puts
+
+        if searchkick_index
+          puts "Model Search Data"
+          begin
+            pp klass.first(3).map { |r| {index: searchkick_index.record_data(r).merge(data: searchkick_index.send(:search_data, r))}}
+          rescue => e
+            puts "#{e.class.name}: #{e.message}"
+          end
+          puts
+
+          puts "Elasticsearch Mapping"
+          puts JSON.pretty_generate(searchkick_index.mapping)
+          puts
+
+          puts "Elasticsearch Settings"
+          puts JSON.pretty_generate(searchkick_index.settings)
+          puts
+        end
+
+        puts "Elasticsearch Query"
+        puts to_curl
+        puts
+
+        puts "Elasticsearch Results"
+        puts JSON.pretty_generate(response)
+      end
 
       # set execute for multi search
       @execute = Searchkick::Results.new(searchkick_klass, response, opts)
@@ -159,17 +206,17 @@ module Searchkick
       padding = [options[:padding].to_i, 0].max
       offset = options[:offset] || (page - 1) * per_page + padding
 
-      # model and eagar loading
+      # model and eager loading
       load = options[:load].nil? ? true : options[:load]
 
-      conversions_field = searchkick_options[:conversions]
-      personalize_field = searchkick_options[:personalize]
+      conversions_fields = Array(options[:conversions] || searchkick_options[:conversions]).map(&:to_s)
+      personalize_field  = searchkick_options[:personalize]
 
       all = term == "*"
 
-      options[:json] ||= options[:body]
-      if options[:json]
-        payload = options[:json]
+      @json = options[:json] || options[:body]
+      if @json
+        payload = @json
       else
         if options[:query]
           payload = options[:query]
@@ -257,7 +304,7 @@ module Searchkick
                 f = field.split(".")[0..-2].join(".")
                 queries << {match: {f => shared_options.merge(analyzer: "keyword")}}
               else
-                analyzer = field.match(/\.word_(start|middle|end)\z/) ? "searchkick_word_search" : "searchkick_autocomplete_search"
+                analyzer = field =~ /\.word_(start|middle|end)\z/ ? "searchkick_word_search" : "searchkick_autocomplete_search"
                 qs << shared_options.merge(analyzer: analyzer)
               end
 
@@ -265,7 +312,21 @@ module Searchkick
                 qs.concat qs.map { |q| q.except(:cutoff_frequency).merge(fuzziness: edit_distance, prefix_length: prefix_length, max_expansions: max_expansions, boost: factor).merge(transpositions) }
               end
 
-              queries.concat(qs.map { |q| {match_type => {field => q}} })
+              # boost exact matches more
+              if field =~ /\.word_(start|middle|end)\z/ && searchkick_options[:word] != false
+                queries << {
+                  bool: {
+                    must: {
+                      bool: {
+                        should: qs.map { |q| {match_type => {field => q}} }
+                      }
+                    },
+                    should: {match_type => {field.sub(/\.word_(start|middle|end)\z/, ".analyzed") => qs.first}}
+                  }
+                }
+              else
+                queries.concat(qs.map { |q| {match_type => {field => q}} })
+              end
             end
 
             payload = {
@@ -275,34 +336,38 @@ module Searchkick
             }
           end
 
-          if conversions_field && options[:conversions] != false
-            # wrap payload in a bool query
-            script_score =
-              if below12?
-                {script_score: {script: "doc['count'].value"}}
-              else
-                {field_value_factor: {field: "#{conversions_field}.count"}}
-              end
+          if conversions_fields.present? && options[:conversions] != false
+            shoulds = []
+            conversions_fields.each do |conversions_field|
+              # wrap payload in a bool query
+              script_score =
+                if below12?
+                  {script_score: {script: "doc['count'].value"}}
+                else
+                  {field_value_factor: {field: "#{conversions_field}.count"}}
+                end
 
+              shoulds << {
+                nested: {
+                  path: conversions_field,
+                  score_mode: "sum",
+                  query: {
+                    function_score: {
+                      boost_mode: "replace",
+                      query: {
+                        match: {
+                          "#{conversions_field}.query" => term
+                        }
+                      }
+                    }.merge(script_score)
+                  }
+                }
+              }
+            end
             payload = {
               bool: {
                 must: payload,
-                should: {
-                  nested: {
-                    path: conversions_field,
-                    score_mode: "sum",
-                    query: {
-                      function_score: {
-                        boost_mode: "replace",
-                        query: {
-                          match: {
-                            "#{conversions_field}.query" => term
-                          }
-                        }
-                      }.merge(script_score)
-                    }
-                  }
-                }
+                should: shoulds
               }
             }
           end
@@ -341,9 +406,13 @@ module Searchkick
           from: offset
         }
         payload[:explain] = options[:explain] if options[:explain]
+        payload[:profile] = options[:profile] if options[:profile]
 
         # order
         set_order(payload) if options[:order]
+
+        # indices_boost
+        set_boost_by_indices(payload)
 
         # filters
         filters = where_filters(options[:where])
@@ -361,6 +430,9 @@ module Searchkick
         # highlight
         set_highlights(payload, fields) if options[:highlight]
 
+        # timeout shortly after client times out
+        payload[:timeout] ||= "#{Searchkick.search_timeout + 1}s"
+
         # An empty array will cause only the _id and _type for each hit to be returned
         # doc for :select - http://www.elasticsearch.org/guide/reference/api/search/fields/
         # doc for :select_v2 - https://www.elastic.co/guide/en/elasticsearch/reference/current/search-request-source-filtering.html
@@ -368,13 +440,22 @@ module Searchkick
           payload[:fields] = options[:select] if options[:select] != true
         elsif options[:select_v2]
           if options[:select_v2] == []
-            payload[:fields] = [] # intuitively [] makes sense to return no fields, but ES by default returns all fields
+            # intuitively [] makes sense to return no fields, but ES by default returns all fields
+            if below50?
+              payload[:fields] = []
+            else
+              payload[:_source] = false
+            end
           else
             payload[:_source] = options[:select_v2]
           end
         elsif load
           # don't need any fields since we're going to load them from the DB anyways
-          payload[:fields] = []
+          if below50?
+            payload[:fields] = []
+          else
+            payload[:_source] = false
+          end
         end
 
         if options[:type] || (klass != searchkick_klass && searchkick_index)
@@ -385,8 +466,11 @@ module Searchkick
         @routing = options[:routing] if options[:routing]
       end
 
+      # merge more body options
+      payload = payload.deep_merge(options[:body_options]) if options[:body_options]
+
       @body = payload
-      @facet_limits = @facet_limits || {}
+      @facet_limits ||= {}
       @page = page
       @per_page = per_page
       @padding = padding
@@ -469,6 +553,19 @@ module Searchkick
       end
     end
 
+    def set_boost_by_indices(payload)
+      return unless options[:indices_boost]
+
+      indices_boost = options[:indices_boost].each_with_object({}) do |(key, boost), memo|
+        index = key.respond_to?(:searchkick_index) ? key.searchkick_index.name : key
+        # try to use index explicitly instead of alias: https://github.com/elasticsearch/elasticsearch/issues/4756
+        index_by_alias = Searchkick.client.indices.get_alias(index: index).keys.first
+        memo[index_by_alias || index] = boost
+      end
+
+      payload[:indices_boost] = indices_boost
+    end
+
     def set_suggestions(payload)
       suggest_fields = (searchkick_options[:suggest] || []).map(&:to_s)
 
@@ -543,6 +640,14 @@ module Searchkick
               field: agg_options[:field] || field,
               ranges: agg_options[:date_ranges]
             }.merge(shared_agg_options)
+          }
+        elsif histogram = agg_options[:date_histogram]
+          interval = histogram[:interval]
+          payload[:aggs][field] = {
+            date_histogram: {
+              field: histogram[:field],
+              interval: interval
+            }
           }
         else
           payload[:aggs][field] = {
@@ -679,6 +784,24 @@ module Searchkick
               filters << {bool: {should: or_clause.map { |or_statement| {bool: {filter: where_filters(or_statement)}} }}}
             end
           end
+        elsif field == :_or
+          if below20?
+            filters << {or: value.map { |or_statement| {and: where_filters(or_statement)} }}
+          else
+            filters << {bool: {should: value.map { |or_statement| {bool: {filter: where_filters(or_statement)}} }}}
+          end
+        elsif field == :_not
+          if below20?
+            filters << {not: {and: where_filters(value)}}
+          else
+            filters << {bool: {must_not: where_filters(value)}}
+          end
+        elsif field == :_and
+          if below20?
+            filters << {and: value.map { |or_statement| {and: where_filters(or_statement)} }}
+          else
+            filters << {bool: {must: value.map { |or_statement| {bool: {filter: where_filters(or_statement)}} }}}
+          end
         else
           # expand ranges
           if value.is_a?(Range)
@@ -699,6 +822,23 @@ module Searchkick
                     distance: value[:within] || "50mi"
                   }
                 }
+              when :geo_polygon
+                filters << {
+                  geo_polygon: {
+                    field => op_value
+                  }
+                }
+              when :geo_shape
+                shape = op_value.except(:relation)
+                shape[:coordinates] = coordinate_array(shape[:coordinates]) if shape[:coordinates]
+                filters << {
+                  geo_shape: {
+                    field => {
+                      relation: op_value[:relation] || "intersects",
+                      shape: shape
+                    }
+                  }
+                }
               when :top_left
                 filters << {
                   geo_bounding_box: {
@@ -717,8 +857,8 @@ module Searchkick
                   filters << {bool: {must_not: term_filters(field, op_value)}}
                 end
               when :all
-                op_value.each do |value|
-                  filters << term_filters(field, value)
+                op_value.each do |val|
+                  filters << term_filters(field, val)
                 end
               when :in
                 filters << term_filters(field, op_value)
@@ -811,6 +951,19 @@ module Searchkick
             }
           }
         }.merge(script_score)
+      end
+    end
+
+    # Recursively descend through nesting of arrays until we reach either a lat/lon object or an array of numbers,
+    # eventually returning the same structure with all values transformed to [lon, lat].
+    #
+    def coordinate_array(value)
+      if value.is_a?(Hash)
+        [value[:lon], value[:lat]]
+      elsif value.is_a?(Array) and !value[0].is_a?(Numeric)
+        value.map {|a| coordinate_array(a) }
+      else
+        value
       end
     end
 

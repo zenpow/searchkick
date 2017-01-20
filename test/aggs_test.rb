@@ -42,7 +42,7 @@ class AggsTest < Minitest::Test
     agg = Product.search("Product", aggs: {store_id: {limit: 1}}).aggs["store_id"]
     assert_equal 1, agg["buckets"].size
     # assert_equal 3, agg["doc_count"]
-    assert_equal(1, agg["sum_other_doc_count"]) if Gem::Version.new(Searchkick.server_version) >= Gem::Version.new("1.4.0")
+    assert_equal(1, agg["sum_other_doc_count"]) unless Searchkick.server_below?("1.4.0")
   end
 
   def test_ranges
@@ -94,6 +94,27 @@ class AggsTest < Minitest::Test
   def test_smart_aggs_false
     assert_equal ({2 => 2}), store_agg(where: {color: "red"}, aggs: {store_id: {where: {in_stock: false}}}, smart_aggs: false)
     assert_equal ({2 => 2}), store_agg(where: {color: "blue"}, aggs: {store_id: {where: {in_stock: false}}}, smart_aggs: false)
+  end
+
+  def test_aggs_group_by_date
+    store [{name: "Old Product", created_at: 3.years.ago}]
+    aggs = Product.search(
+      "Product",
+              aggs: {
+                products_per_year: {
+                  date_histogram: {
+                    field: :created_at,
+                    interval: :year
+                  }
+                }
+              }
+    ).aggs
+
+    if elasticsearch_below20?
+      assert_equal 2, aggs["products_per_year"]["buckets"].size
+    else
+      assert_equal 4, aggs["products_per_year"]["buckets"].size
+    end
   end
 
   protected
