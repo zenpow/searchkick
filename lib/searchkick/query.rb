@@ -574,6 +574,8 @@ module Searchkick
         suggest_fields &= options[:fields].map { |v| (v.is_a?(Hash) ? v.keys.first : v).to_s.split("^", 2).first }
       end
 
+      suggest_fields = options[:suggest_fields].map(&:to_s) if suggest_fields.empty?
+
       if suggest_fields.any?
         payload[:suggest] = {text: term}
         suggest_fields.each do |field|
